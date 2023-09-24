@@ -341,7 +341,7 @@ where
                     let instruction_count = r.instructions.len();
                     log::debug!("Instruction Count: {}", instruction_count);
 
-                    for ix in r.instructions.iter() {
+                    for (ix_idx, ix) in r.instructions.iter().enumerate() {
                         match handle_compiled_instruction(
                             connection,
                             ix,
@@ -354,10 +354,13 @@ where
                                 // This value is the index into the previously split program logs where an event was found.
                                 // So this is where we are going to split the remaining logs before continuing to iterate.
                                 if idx != 0 {
+                                    log::debug!("Event Log Index: {}", idx);
                                     let (_, split_rem_logs) = rem_logs.split_at(idx);
                                     rem_logs = split_rem_logs.to_vec();
                                     processed_events += 1;
+                                    continue;
                                 }
+                                log::debug!("Found no events for instruction {}", ix_idx);
                             }
                             Err(e) => {
                                 // If we fail to process the instruction, we will simply return with the error
