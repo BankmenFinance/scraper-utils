@@ -342,11 +342,12 @@ where
                     log::debug!("Instruction Count: {}", instruction_count);
 
                     for (ix_idx, ix) in r.instructions.iter().enumerate() {
+                        log::debug!("Logs: {:?}", rem_logs);
                         match handle_compiled_instruction(
                             connection,
                             ix,
                             &r.account_keys,
-                            &logs,
+                            &rem_logs,
                             &program_id,
                             &log_handler,
                         ) {
@@ -355,7 +356,7 @@ where
                                 // So this is where we are going to split the remaining logs before continuing to iterate.
                                 if idx != 0 {
                                     log::debug!("Event Log Index: {}", idx);
-                                    let (_, split_rem_logs) = rem_logs.split_at(idx);
+                                    let (_, split_rem_logs) = rem_logs.split_at(idx + 1);
                                     rem_logs = split_rem_logs.to_vec();
                                     processed_events += 1;
                                     continue;
@@ -384,14 +385,14 @@ where
                         .map(|a| a.pubkey.clone())
                         .collect::<Vec<String>>();
 
-                    for ix in p.instructions.iter() {
+                    for (ix_idx, ix) in p.instructions.iter().enumerate() {
                         match ix {
                             solana_transaction_status::UiInstruction::Compiled(ui_compiled_ix) => {
                                 match handle_compiled_instruction(
                                     connection,
                                     ui_compiled_ix,
                                     &tx_account_keys,
-                                    &logs,
+                                    &rem_logs,
                                     &program_id,
                                     &log_handler,
                                 ) {
@@ -399,10 +400,13 @@ where
                                         // This value is the index into the previously split program logs where an event was found.
                                         // So this is where we are going to split the remaining logs before continuing to iterate.
                                         if idx != 0 {
-                                            let (_, split_rem_logs) = rem_logs.split_at(idx);
+                                            log::debug!("Event Log Index: {}", idx);
+                                            let (_, split_rem_logs) = rem_logs.split_at(idx + 1);
                                             rem_logs = split_rem_logs.to_vec();
                                             processed_events += 1;
+                                            continue;
                                         }
+                                        log::debug!("Found no events for instruction {}", ix_idx);
                                     }
                                     Err(e) => {
                                         // If we fail to process the instruction, we will simply return with the error
@@ -484,7 +488,7 @@ where
     if !(ix_program_id == &check_program_id.to_string() || ix_program_id == SMPL_ID) {
         // If the instruction's Program Id does not match either the provided Program Id or the Squads Multisig Program Id
         // we return earlier.
-
+        log::debug!("Program ID does not match target or SMPL.");
         // Returning zero as a value here is because we did not process any logs, so there is no need for the caller
         // to split the remaining logs before attempting to invoke the callee again to process the next instruction.
         return Ok(0);
@@ -505,5 +509,6 @@ where
             continue;
         }
     }
+    log::debug!("Processed all logs..");
     Ok(0)
 }
