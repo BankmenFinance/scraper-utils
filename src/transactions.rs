@@ -161,7 +161,7 @@ static PROGRAM_DATA: &str = "Program data: ";
 
 /// Errors which are returned during execution of functions related to
 /// processing transaction program logs.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
     #[error("Error parsing logs: {0}")]
     LogParseError(String),
@@ -351,12 +351,16 @@ where
                             &program_id,
                             &log_handler,
                         ) {
-                            Ok(idx) => {
-                                // This value is the index into the previously split program logs where an event was found.
-                                // So this is where we are going to split the remaining logs before continuing to iterate.
-                                if idx != 0 {
-                                    log::debug!("Event Log Index: {}", idx);
-                                    let (_, split_rem_logs) = rem_logs.split_at(idx + 1);
+                            Ok((last_index, logs_handled)) => {
+                                // This value is the index into the previously split program logs that was last processed
+                                // So this is where we are going to split the remaining logs before continuing to iterate over the instructions.
+                                if last_index != 0 {
+                                    log::debug!(
+                                        "Event Logs Handled: {} - Last Index: {}",
+                                        logs_handled,
+                                        last_index
+                                    );
+                                    let (_, split_rem_logs) = rem_logs.split_at(last_index + 1);
                                     rem_logs = split_rem_logs.to_vec();
                                     processed_events += 1;
                                     continue;
@@ -396,12 +400,17 @@ where
                                     &program_id,
                                     &log_handler,
                                 ) {
-                                    Ok(idx) => {
-                                        // This value is the index into the previously split program logs where an event was found.
-                                        // So this is where we are going to split the remaining logs before continuing to iterate.
-                                        if idx != 0 {
-                                            log::debug!("Event Log Index: {}", idx);
-                                            let (_, split_rem_logs) = rem_logs.split_at(idx + 1);
+                                    Ok((last_index, logs_handled)) => {
+                                        // This value is the index into the previously split program logs that was last processed
+                                        // So this is where we are going to split the remaining logs before continuing to iterate over the instructions.
+                                        if last_index != 0 {
+                                            log::debug!(
+                                                "Event Logs Handled: {} - Last Index: {}",
+                                                logs_handled,
+                                                last_index
+                                            );
+                                            let (_, split_rem_logs) =
+                                                rem_logs.split_at(last_index + 1);
                                             rem_logs = split_rem_logs.to_vec();
                                             processed_events += 1;
                                             continue;
@@ -463,7 +472,7 @@ fn handle_compiled_instruction<F>(
     tx_remaining_logs: &[String],
     check_program_id: &Pubkey,
     log_handler: &F,
-) -> Result<usize, Error>
+) -> Result<(usize, usize), Error>
 where
     F: Fn(
         &mut Option<&mut PgConnection>,
@@ -477,7 +486,7 @@ where
     let ix_program_id = match &tx_account_keys
         .iter()
         .enumerate()
-        .find(|(idx, _)| *idx == ix.program_id_index as usize)
+        .find(|(_, key)| *key == &check_program_id.to_string())
     {
         Some((_, account_key)) => *account_key,
         None => return Err(Error::ProgramIdNotFound),
@@ -491,24 +500,522 @@ where
         log::debug!("Program ID does not match target or SMPL.");
         // Returning zero as a value here is because we did not process any logs, so there is no need for the caller
         // to split the remaining logs before attempting to invoke the callee again to process the next instruction.
-        return Ok(0);
+        return Ok((0, 0));
     }
 
     // We are going to iterate the provided remaining logs associated with this instruction and if we find
     // a program log that represents an anchor event, we will call the given log handler function so that the log can be processed.
 
+    let mut invoke_stack = Vec::new();
+    let mut logs_handled = 0;
+
     for (log_idx, l) in tx_remaining_logs.iter().enumerate() {
-        log::info!("Log: {}", l);
+        println!("Log: {}", l);
+
+        let log_split = l.split(" ").collect::<Vec<&str>>();
+
+        // if the log contains "Program" and "invoke" then we know that the second string is the program id being invoked
+        // we'll add this program id to a stack so we can keep track of inner invocations
+        if l.contains("Program") && l.contains("invoke") {
+            invoke_stack.push(log_split[1]);
+        }
 
         if let Some(event_log) = l.strip_prefix(PROGRAM_DATA) {
             match log_handler(connection, ix, tx_account_keys, event_log) {
-                Ok(()) => return Ok(log_idx),
+                Ok(()) => {
+                    logs_handled += 1;
+                }
                 Err(e) => return Err(e),
             }
-        } else {
-            continue;
+        }
+
+        // if the log contains "Program" and "success" then we know that this invocation is now over
+        //
+        if l.contains("Program") && l.contains("success") {
+            invoke_stack.pop();
+        }
+
+        // if the invocation stack is empty
+        // then that means we've processed this instruction and thus we should return
+        if invoke_stack.is_empty() {
+            return Ok((log_idx, logs_handled));
         }
     }
-    log::debug!("Processed all logs..");
-    Ok(0)
+    println!("Processed all logs..");
+    Ok((0, 0))
+}
+
+mod tests {
+    use super::*;
+    use crate::Error;
+    use solana_transaction_status::UiCompiledInstruction;
+
+    #[allow(dead_code)]
+    fn get_tx_1_logs() -> Vec<String> {
+        return vec![
+            "Program ComputeBudget111111111111111111111111111111 invoke [1]".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 success".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 invoke [1]".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 success".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW invoke [1]".to_string(),
+            "Program log: Instruction: OfferLoan".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]".to_string(),
+            "Program log: Instruction: InitializeAccount3".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 3158 of 162682 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program data: ehxky17/XPgiVr33CnxXF/0y7MgdsKjnpziiexE8xoCZ/X8lUtyO1t3C+ojU/DbGbFgVIZZKo0qvcIA1NDD4N4RuLnpFsbcpBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFhI1zgO4Oswp/RdsH5+K3ClO5A3+x8X4u1dSuDExC5tnTGOwmpl+Gg3cuaPnIuh9xMYsXW9UDo8+khKmxTOOjaAMqaOwAAAAABASwB".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW consumed 55100 of 200000 compute units".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW success".to_string(),
+        ];
+    }
+
+    #[allow(dead_code)]
+    fn get_tx_2_logs() -> Vec<String> {
+        return vec![
+            "Program ComputeBudget111111111111111111111111111111 invoke [1]".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 success".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 invoke [1]".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 success".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW invoke [1]".to_string(),
+            "Program log: Instruction: TakeLoan".to_string(),
+            "Program log: Token Standard: Legacy".to_string(),
+            "Program log: Loan Type: Simple".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]".to_string(),
+            "Program log: Instruction: Approve".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 2904 of 267771 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program log: Freezing Legacy NFT.".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s invoke [2]".to_string(),
+            "Program log: IX: Freeze Delegated Account".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [3]".to_string(),
+            "Program log: Instruction: FreezeAccount".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 4310 of 247723 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s consumed 18482 of 261244 compute units".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s success".to_string(),
+            "Program log: Froze Legacy NFT.".to_string(),
+            "Program log: Transferring funds to borrower for 100000000 native units of Loan Token Mint.".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW consumed 67794 of 300000 compute units".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW success".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW invoke [1]".to_string(),
+            "Program log: Instruction: TakeLoan".to_string(),
+            "Program log: Token Standard: Legacy".to_string(),
+            "Program log: Loan Type: Simple".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]".to_string(),
+            "Program log: Instruction: Approve".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 2904 of 199977 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program log: Freezing Legacy NFT.".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s invoke [2]".to_string(),
+            "Program log: IX: Freeze Delegated Account".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [3]".to_string(),
+            "Program log: Instruction: FreezeAccount".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 4310 of 181429 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s consumed 16982 of 193450 compute units".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s success".to_string(),
+            "Program log: Froze Legacy NFT.".to_string(),
+            "Program log: Transferring funds to borrower for 50000000 native units of Loan Token Mint.".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DQV4rcNvw+46jMn8gQ7LlBz3zKDZdT7eFLRfrXkylzR/pi9RmDXKCaut29g2py0MZyonZmC+VUgrbYb4b0+A4KSCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAAC4kwEDAAAAAIDw+gIAAAAA".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW consumed 66278 of 232206 compute units".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW success".to_string(),
+          ];
+    }
+
+    #[allow(dead_code)]
+    fn get_tx_3_logs() -> Vec<String> {
+        return vec![
+            "Program ComputeBudget111111111111111111111111111111 invoke [1]".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 success".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 invoke [1]".to_string(),
+            "Program ComputeBudget111111111111111111111111111111 success".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW invoke [1]".to_string(),
+            "Program log: Instruction: TakeLoan".to_string(),
+            "Program log: Token Standard: Legacy".to_string(),
+            "Program log: Loan Type: Simple".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]".to_string(),
+            "Program log: Instruction: Approve".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 2904 of 267771 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program log: Freezing Legacy NFT.".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s invoke [2]".to_string(),
+            "Program log: IX: Freeze Delegated Account".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [3]".to_string(),
+            "Program log: Instruction: FreezeAccount".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 4310 of 247723 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s consumed 18482 of 261244 compute units".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s success".to_string(),
+            "Program log: Froze Legacy NFT.".to_string(),
+            "Program log: Transferring funds to borrower for 100000000 native units of Loan Token Mint.".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW consumed 67794 of 300000 compute units".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW success".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW invoke [1]".to_string(),
+            "Program log: Instruction: TakeLoan".to_string(),
+            "Program log: Token Standard: Legacy".to_string(),
+            "Program log: Loan Type: Simple".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]".to_string(),
+            "Program log: Instruction: Approve".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 2904 of 199977 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program log: Freezing Legacy NFT.".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s invoke [2]".to_string(),
+            "Program log: IX: Freeze Delegated Account".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [3]".to_string(),
+            "Program log: Instruction: FreezeAccount".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 4310 of 181429 compute units".to_string(),
+            "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DcYk55fH15kF/mzUo6fmGs4q/N++QUm0Lg/CswTp0SV4pwT5ktBrp9/VPW7gwYwll5VNst+vOE/l43qLuoiba4GCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAABwJwMGAAAAAADh9QUAAAAA".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s consumed 16982 of 193450 compute units".to_string(),
+            "Program metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s success".to_string(),
+            "Program log: Froze Legacy NFT.".to_string(),
+            "Program log: Transferring funds to borrower for 50000000 native units of Loan Token Mint.".to_string(),
+            "Program 11111111111111111111111111111111 invoke [2]".to_string(),
+            "Program 11111111111111111111111111111111 success".to_string(),
+            "Program data: Pkx/rX/Hh4s4as/aLoeQzk3pqvMJWbkB+4pUWF/hfVFUXPmCb/+1DQV4rcNvw+46jMn8gQ7LlBz3zKDZdT7eFLRfrXkylzR/pi9RmDXKCaut29g2py0MZyonZmC+VUgrbYb4b0+A4KSCAsChynRJiNh6lqpEx7f7RjyNHqILKslZT8iWInqk41GS+33LjRHmLT7n2lFMOCpvC6+qA7itxPeO2kgLJeCA9sIRZQAAAAC4kwEDAAAAAIDw+gIAAAAA".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW consumed 66278 of 232206 compute units".to_string(),
+            "Program BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW success".to_string(),
+          ];
+    }
+
+    #[allow(dead_code)]
+    fn get_tx_1_accounts() -> Vec<String> {
+        return vec![
+            "7YBpfGJi2kEYJNkZBJn9j5we4HHzjJy2KZ155mEe5udo".to_string(),
+            "3K3aTU78GCtzEDBJcuPPSQjUF7aoq5As2jZnMi2dtTch".to_string(),
+            "5kTog8xPUiVpwswQFSPNbxTJ7JVpaazfgR8djNoeD5eQ".to_string(),
+            "8rqcL29F1UuwFNhubmeckZAKqpWwBr1UgiAP2yKJxpg1".to_string(),
+            "AKLXBVd4Ft3WreQTej5zwrj59UTSFTdrhnsQYuJ9E3yd".to_string(),
+            "F9MrguGEAnQjuZNwKNRhmN2th6D9xz4UJUNMv98UaeRJ".to_string(),
+            "FvfYPyUnNfsiF8XYrxTgHTji6NeVM1r5ierCbqg6m2wz".to_string(),
+            "11111111111111111111111111111111".to_string(),
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string(),
+            "BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW".to_string(),
+            "ComputeBudget111111111111111111111111111111".to_string(),
+            "So11111111111111111111111111111111111111112".to_string(),
+            "SysvarRent111111111111111111111111111111111".to_string(),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+        ];
+    }
+
+    #[allow(dead_code)]
+    fn log_handler(
+        _connection: &mut Option<&mut PgConnection>,
+        ix: &UiCompiledInstruction,
+        _accounts: &[String],
+        _log: &str,
+    ) -> Result<(), Error> {
+        println!("{:?}", ix);
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_compiled_instruction_err() -> Result<(), Error> {
+        let logs = get_tx_1_logs();
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![],
+                data: String::new(),
+                stack_height: Some(1),
+            },
+            &[String::new()],
+            &logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        assert_eq!(res, Err(Error::ProgramIdNotFound));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_compiled_instruction() -> Result<(), Error> {
+        let logs = get_tx_1_logs();
+        let accounts = get_tx_1_accounts();
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_compiled_instruction_from_tx_1_full() -> Result<(), Error> {
+        let logs = get_tx_1_logs();
+        let accounts = get_tx_1_accounts();
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        let (_, rem_logs) = logs.split_at(2);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        let (_, rem_logs) = rem_logs.split_at(2);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 9, // in this case let's set the correct index for the bankmen lending program
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &Pubkey::from_str("BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW").unwrap(),
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (16, 1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_compiled_instruction_from_tx_2_full() -> Result<(), Error> {
+        let logs = get_tx_2_logs();
+        let accounts = get_tx_1_accounts();
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        let (_, rem_logs) = logs.split_at(2);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        let (_, rem_logs) = rem_logs.split_at(2);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 9, // in this case let's set the correct index for the bankmen lending program
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &Pubkey::from_str("BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW").unwrap(),
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (23, 1));
+
+        let (_, rem_logs) = rem_logs.split_at(24);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 9, // in this case let's set the correct index for the bankmen lending program
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &Pubkey::from_str("BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW").unwrap(),
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (23, 1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_compiled_instruction_from_tx_3_full() -> Result<(), Error> {
+        let logs = get_tx_3_logs();
+        let accounts = get_tx_1_accounts();
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        let (_, rem_logs) = logs.split_at(2);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 10, // in this case let's set the correct index for the compute budget
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &anchor_lang::system_program::ID,
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (1, 0));
+
+        let (_, rem_logs) = rem_logs.split_at(2);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 9, // in this case let's set the correct index for the bankmen lending program
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &Pubkey::from_str("BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW").unwrap(),
+            &log_handler,
+        );
+
+        // in this case we are checking for system program logs, but the function returns after the first instruction logs
+        // which is the compute budget program
+        assert_eq!(res.unwrap(), (25, 3));
+
+        let (_, rem_logs) = rem_logs.split_at(26);
+
+        let res = handle_compiled_instruction(
+            &mut None,
+            &UiCompiledInstruction {
+                program_id_index: 9, // in this case let's set the correct index for the bankmen lending program
+                accounts: vec![], // this would be helpful to set if we were testing the log handler
+                data: String::new(), // same goes for this, as this is the instruction data
+                stack_height: Some(1),
+            },
+            &accounts,
+            &rem_logs,
+            &Pubkey::from_str("BMfi6hbCSpTS962EZjwaa6bRvy2izUCmZrpBMuhJ1BUW").unwrap(),
+            &log_handler,
+        );
+
+        // the last instruction also has multiple inner events
+        // we assert that the given log handler gets called 7 times
+        assert_eq!(res.unwrap(), (29, 7));
+
+        Ok(())
+    }
 }
