@@ -231,10 +231,10 @@ where
 
         // Process the transaction logs for the given Program Id.
         match process_transaction_logs(connection, &tx, program_id, &log_handler) {
-            Ok(num_events) => {
+            Ok(num_logs) => {
                 log::info!(
-                    "Successfully processed {} events from transaction.",
-                    num_events
+                    "Successfully handled {} instruction logs from transaction.",
+                    num_logs
                 );
             }
             Err(e) => {
@@ -510,7 +510,7 @@ where
     let mut logs_handled = 0;
 
     for (log_idx, l) in tx_remaining_logs.iter().enumerate() {
-        println!("Log: {}", l);
+        log::debug!("Log: {}", l);
 
         let log_split = l.split(" ").collect::<Vec<&str>>();
 
@@ -541,7 +541,7 @@ where
             return Ok((log_idx, logs_handled));
         }
     }
-    println!("Processed all logs..");
+    log::debug!("Processed all logs..");
     Ok((0, 0))
 }
 
