@@ -37,7 +37,7 @@ pub async fn get_transaction(
             RpcTransactionConfig {
                 encoding: Some(UiTransactionEncoding::Json),
                 commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: None,
+                max_supported_transaction_version: Some(0),
             },
         )
         .await
