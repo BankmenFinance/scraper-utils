@@ -238,7 +238,17 @@ where
                 );
             }
             Err(e) => {
-                return Err(e);
+                // If we error out processing the logs, do not return with an error.
+                // We attempt to process remaining transactions, if possible, and let callee deal with failed sigantures.
+                log::error!(
+                    "Failed to process transaction logs for transaction with signature: {:?}. Error: {:?}",
+                    signature.signature, e
+                );
+                failed_signatures.push(signature.clone());
+                // We failed to process this one transaction, so let's continue our loop and not try to insert it into database.
+                // TODO: Inserting the signatures into database here is naive at best. In hindsight it should be callee to filter out signatures
+                // which didn't fail to be processed and insert them after calling us.
+                continue;
             }
         };
 
